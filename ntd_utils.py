@@ -1,5 +1,3 @@
-# Работа с характеристиками оборудования
-
 import ast
 import operator as op
 import pandas as pd
@@ -7,6 +5,9 @@ import numpy as np
 from seuif97 import *
 from scipy.interpolate import interp1d, LinearNDInterpolator # импортируем методы интерполяции
 from math import sqrt, sin, log 
+import re
+# Находим все идентификаторы с точками
+
 
 # Расчёт вспомогательных функций
 def calc_Pw(T):
@@ -44,11 +45,22 @@ def add_curve(Curves,Name,X,F):
             Curves.update({Name:LinearNDInterpolator(X, F,rescale=True)})
         return Curves
 
+def preprocess_dotted_variables(code):    
+    pattern = r'\b([a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)+)\b'
+    def replacer(match):
+        return match.group(1).replace('.', '___')
+    return re.sub(pattern, replacer, code)
+
+def rereplace(Name):
+    return Name.replace('___','.')
+    
+
 
 class ExpressionEvaluator:
     def __init__(self, df):
-        self.df = df
+        df.columns=[i.replace('.','___') for i in df.keys() ]
         self.calculated=[]
+        self.df = df
         self.ops = {
             ast.Add: op.add,
             ast.Sub: op.sub,
@@ -56,6 +68,15 @@ class ExpressionEvaluator:
             ast.Div: op.truediv,
             ast.Pow: op.pow,
             ast.USub: op.neg,
+
+            # Операции сравнения
+            ast.Eq: op.eq, ast.NotEq: op.ne,
+            ast.Lt: op.lt, ast.LtE: op.le,
+            ast.Gt: op.gt, ast.GtE: op.ge,
+            
+            # Логические операции
+            ast.And: lambda x, y: x & y,  # Для pandas Series
+            ast.Or: lambda x, y: x | y,   # Для pandas Series            
         }
         
         self.functions = {
@@ -73,6 +94,12 @@ class ExpressionEvaluator:
             # Добавьте другие функции по необходимости
         }
         self.curvs={}
+        
+    def get_df(self):
+        df=self.df.copy()
+        df.columns=[i.replace('___','.') for i in df.keys() ]
+        return df
+        
     def calc_curve(self,Name,*X):
         #print('calc_curve')
         #print('Name:',Name)
@@ -109,6 +136,14 @@ class ExpressionEvaluator:
             func_name = node.func.id
             args = [self._eval(arg) for arg in node.args]
             return self.functions[func_name](*args)
+        elif isinstance(node, ast.Compare):  # Обработка сравнений
+            left = self._eval(node.left)
+            # Обрабатываем цепочку сравнений (например: 30 <= age <= 40)
+            result = left
+            for operation, comparator in zip(node.ops, node.comparators):
+                right = self._eval(comparator)
+                result = self.ops[type(operation)](result, right)
+            return result        
         else:
             raise ValueError(f"Неподдерживаемая операция: {type(node).__name__}")
 
@@ -124,7 +159,10 @@ class ExpressionEvaluator:
         
         # Если результат - Series (один столбец), добавляем в DataFrame
         if isinstance(result, (pd.Series, np.ndarray)):
-            self.df[new_column_name] = result
+            
+            kwargs = {new_column_name: result}
+            #self.df[new_column_name] = #result.values
+            self.df = self.df.assign(**kwargs)
         else:
             # Если результат скалярный, применяем ко всем строкам
             self.df[new_column_name] = result
@@ -140,58 +178,13 @@ class ExpressionEvaluator:
     def calc_expressions_eq(self,expressions):
         # Вычисление выражений
         for expression in expressions:
+            expression=preprocess_dotted_variables(expression)
             col_name, expr = expression.split('=')
             #print(col_name,'=',expr)
             self.calc_expr(expr, col_name)
         return  self.df 
-        
+    
     def get_calc(self):
-        return self.df[self.calculated]    
+        return self.df[self.calculated]
 
 
-def Example():
-        # Функция содержит пример кострукций    
-        expressions_eq=['TsKPU=Tkpu',
-                'TcKPU=Tr_KPU',
-                'Dsp=D2_5',
-                'GsuvEG=clip(GsuvEG,0,10000)',
-                'GKPU=GsuvEG',
-                'Tt=(Tsob1+Tsob2)/2',       # Усреднение температуры
-                
-                'H0=pt2h(P0,T0)',           # Enthalpy of superheated steam
-                'Hsp=pt2h(Psp,Tsp)',        # Enthalpy of industrial extraction
-                'Hst=pt2h(Pt,Tt)',          # Enthalpy of heat extraction
-                'HcPSG=tw2h(TcPSG)',        # Enthalpy of PSG condensate
-                'HsKPU=ts2h(TcKPU)',        # Enthalpy of steam at KPU
-                'dT_c=TcPSG-Tr_PSG',        # PSG temperature undercooling
-                'HwKPU=tw2h(TsuvEG)',       # Enthalpy of SUV before KPU
-                'Hw_KPU=tw2h(Tr_KPU)',      # Enthalpy of SUV after KPU
-
-                'HwPSG=tw2h(TrPSG)',        # Enthalpy of water before PSG
-                'Hw_PSG=tw2h(Tr_PSG)',      # Enthalpy of water after PSG
-
-                'Tt_c=tw2p(Pt)',            # Calculation of Pt_c condensation temperature in PSG by pressure Pt
-                'PcPSG=tw2p(TcPSG)',     # Saturated steam pressure at PSG condensate temperature
-                'Pt_plus_1=Pt+1',           # Pressure in absolute units kgf/cm2
-                'P_PSG=tw2p(Tr_PSG)',     # Saturated steam pressure at temperature
-
-                "D0_=fig('D0',Pt,N)"
-               ]
-
-        # Загрузка исходных временных рядов
-        # Data Reading
-        FileName='TA5.xlsx'
-        DF5_P=pd.read_excel(FileName)
-        DF5_P=DF5_P.reset_index().drop(columns='index')
-        DF5_P['time']=pd.to_datetime(DF5_P['time'])
-        DF5_P=DF5_P.set_index('time')
-        DF5_P.columns=[i[4:] for i in DF5_P.keys()]
-        DF5_P.head()
-        
-        evaluator = ExpressionEvaluator(DF5_P)
-        # Расчёт D0
-        D0=pd.read_excel('D0Curve.xlsx')
-        evaluator.add_curve('D0',D0[['Pt','N']],D0[['D0']])
-        # Расчёт по уравнениям
-        result = evaluator.calc_expressions_eq(expressions_eq) 
-        return result 
